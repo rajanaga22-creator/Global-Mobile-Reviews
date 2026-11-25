@@ -69,8 +69,6 @@ product_silhouette = (
         n_clusters=product_cluster_count,
         feature_columns=product_feature_columns,
     )
-    if len(product_catalog) >= 3
-    else None
 )
 
 with st.sidebar:
@@ -160,21 +158,26 @@ st.caption(
 
 st.subheader("Phone clusters")
 st.write(
-    "Phone models are grouped by review count, price, observed rating, and "
-    "feature ratings. Cluster numbers are labels, not rankings."
+    "The elbow method selects the cluster count from the within-cluster "
+    "inertia curve. Phone models are grouped by review count, price, observed "
+    "rating, and feature ratings. Cluster numbers are labels, not rankings."
 )
-if product_silhouette is None:
-    st.metric("Silhouette score", "Not available")
-else:
+if product_silhouette is not None:
     st.metric("Silhouette score", f"{product_silhouette:.3f}")
-    st.write(
-        f"Best configuration: **{product_cluster_count} clusters** using "
-        f"{len(product_feature_columns)} tuned features."
-    )
     st.caption(
         "Silhouette scores range from -1 to 1. Higher values indicate better "
-        "separated and more cohesive clusters."
+        "separated and more cohesive clusters; this score does not select "
+        "the cluster count."
     )
+else:
+    st.metric("Silhouette score", "Not available")
+st.write(
+    f"Elbow-selected configuration: **{product_cluster_count} clusters** "
+    f"using {len(product_feature_columns)} tuned features."
+)
+inertia_curve = pd.DataFrame(product_tuning["inertia_curve"])
+if not inertia_curve.empty:
+    st.line_chart(inertia_curve.set_index("n_clusters"))
 for segment, group in clustered_products.groupby("product_segment", sort=True):
     st.markdown(f"### Cluster {segment + 1}")
     metrics = st.columns(3)

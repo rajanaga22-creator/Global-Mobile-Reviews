@@ -20,7 +20,9 @@ performance, design, and display.
 2. `mob.py` cleans missing prices and ratings and creates one summary for each
    phone model.
 3. Cosine similarity compares phone models and finds the closest matches.
-4. K-means clustering groups similar phones into clusters.
+4. The elbow method selects the K-means cluster count from within-cluster
+   inertia, then groups similar phones. A silhouette score is shown separately
+   as a clustering-quality metric.
 5. `app.py` displays the recommendations and filters in a Streamlit website.
 
 ## Project Files

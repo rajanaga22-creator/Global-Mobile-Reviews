@@ -52,6 +52,7 @@ PRODUCT_FEATURES = [
 PRODUCT_CLUSTER_FEATURES = ["review_count", *PRODUCT_FEATURES]
 
 
+# Data cleaning and loading
 def clean_mobile_data(data: pd.DataFrame) -> pd.DataFrame:
     """Return a cleaned copy of mobile review data, retaining imputation flags."""
     missing_columns = REQUIRED_COLUMNS.difference(data.columns)
@@ -160,6 +161,7 @@ def clean_mobile_data(data: pd.DataFrame) -> pd.DataFrame:
     return cleaned
 
 
+# Product catalog
 def load_cleaned_data(path: Path = DEFAULT_OUTPUT) -> pd.DataFrame:
     """Load cleaned data or generate it from the project's original CSV."""
     if path.exists():
@@ -211,6 +213,7 @@ def build_product_catalog(data: pd.DataFrame) -> pd.DataFrame:
     )
 
 
+# Product clustering
 def cluster_products(
     catalog: pd.DataFrame,
     n_clusters: int = 4,
@@ -246,8 +249,8 @@ def calculate_product_silhouette(
     catalog: pd.DataFrame,
     n_clusters: int = 4,
     feature_columns: list[str] | None = None,
-) -> float:
-    """Return the silhouette score for the product K-Means clustering."""
+) -> float | None:
+    """Return the silhouette score, or None when clustering is degenerate."""
     if feature_columns is None:
         feature_columns = PRODUCT_CLUSTER_FEATURES
     missing_columns = set(feature_columns).difference(catalog.columns)
@@ -268,17 +271,52 @@ def calculate_product_silhouette(
         KMeans(n_clusters=n_clusters, random_state=42, n_init=50),
     )
     labels = clusterer.fit_predict(features)
+    if not 2 <= len(set(labels)) < len(catalog):
+        return None
     scaled_features = clusterer[:-1].transform(features)
     return float(silhouette_score(scaled_features, labels))
 
 
+# Elbow-based cluster-count selection
+def _find_elbow_cluster_count(inertia_by_cluster: dict[int, float]) -> int:
+    """Choose the cluster count with the greatest distance from the endpoint line."""
+    cluster_counts = sorted(inertia_by_cluster)
+    if not cluster_counts:
+        raise ValueError("At least one inertia value is required.")
+    if len(cluster_counts) < 3:
+        return cluster_counts[0]
+
+    first_count, last_count = cluster_counts[0], cluster_counts[-1]
+    first_inertia = inertia_by_cluster[first_count]
+    last_inertia = inertia_by_cluster[last_count]
+    count_range = last_count - first_count
+    inertia_range = first_inertia - last_inertia
+    if count_range == 0 or inertia_range <= 0:
+        return first_count
+
+    max_distance = -1.0
+    elbow_count = first_count
+    for cluster_count in cluster_counts[1:-1]:
+        normalized_count = (cluster_count - first_count) / count_range
+        normalized_inertia = (
+            inertia_by_cluster[cluster_count] - last_inertia
+        ) / inertia_range
+        distance = abs(normalized_inertia - (1 - normalized_count)) / 2**0.5
+        if distance > max_distance:
+            max_distance = distance
+            elbow_count = cluster_count
+    return elbow_count
+
+
+# Product cluster tuning
 def tune_product_clustering(catalog: pd.DataFrame) -> dict[str, object]:
-    """Find the best valid product feature set and K-Means cluster count."""
+    """Choose a product cluster count with the elbow method."""
     if len(catalog) < 3:
         return {
             "n_clusters": 1,
             "feature_columns": [],
             "silhouette": None,
+            "inertia_curve": [],
         }
 
     tuning_catalog = catalog.copy()
@@ -318,11 +356,13 @@ def tune_product_clustering(catalog: pd.DataFrame) -> dict[str, object]:
         "n_clusters": 2,
         "feature_columns": feature_sets[0],
         "silhouette": -1.0,
+        "inertia_curve": [],
     }
     max_clusters = min(10, len(tuning_catalog) - 1)
 
     for feature_columns in feature_sets:
         features = tuning_catalog[feature_columns]
+        inertia_by_cluster = {}
         for n_clusters in range(2, max_clusters + 1):
             clusterer = make_pipeline(
                 SimpleImputer(strategy="median"),
@@ -334,18 +374,45 @@ def tune_product_clustering(catalog: pd.DataFrame) -> dict[str, object]:
                 ),
             )
             labels = clusterer.fit_predict(features)
-            scaled_features = clusterer[:-1].transform(features)
-            score = float(silhouette_score(scaled_features, labels))
-            if score > float(best["silhouette"]):
-                best = {
-                    "n_clusters": n_clusters,
-                    "feature_columns": feature_columns,
-                    "silhouette": score,
-                }
+            inertia_by_cluster[n_clusters] = float(clusterer[-1].inertia_)
+
+        n_clusters = _find_elbow_cluster_count(inertia_by_cluster)
+        clusterer = make_pipeline(
+            SimpleImputer(strategy="median"),
+            StandardScaler(),
+            KMeans(n_clusters=n_clusters, random_state=42, n_init=50),
+        )
+        labels = clusterer.fit_predict(features)
+        unique_labels = len(set(labels))
+        if not best["inertia_curve"]:
+            best = {
+                "n_clusters": n_clusters,
+                "feature_columns": feature_columns,
+                "silhouette": -1.0,
+                "inertia_curve": [
+                    {"n_clusters": count, "inertia": inertia}
+                    for count, inertia in inertia_by_cluster.items()
+                ],
+            }
+        if not 2 <= unique_labels < len(tuning_catalog):
+            continue
+        scaled_features = clusterer[:-1].transform(features)
+        score = float(silhouette_score(scaled_features, labels))
+        if score > float(best["silhouette"]):
+            best = {
+                "n_clusters": n_clusters,
+                "feature_columns": feature_columns,
+                "silhouette": score,
+                "inertia_curve": [
+                    {"n_clusters": count, "inertia": inertia}
+                    for count, inertia in inertia_by_cluster.items()
+                ],
+            }
 
     return best
 
 
+# Customer clustering
 def build_customer_catalog(data: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
     """Aggregate reviews into customer profiles suitable for clustering."""
     required = {
@@ -398,11 +465,12 @@ def build_customer_catalog(data: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]
     return catalog, feature_columns
 
 
+# Customer cluster tuning
 def tune_customer_clustering(
     catalog: pd.DataFrame,
     feature_columns: list[str],
 ) -> dict[str, object]:
-    """Find the best customer cluster count using an aggregated customer catalog."""
+    """Choose a customer cluster count with the elbow method."""
     if len(catalog) < 3:
         return {
             "n_clusters": 1,
@@ -411,29 +479,36 @@ def tune_customer_clustering(
 
     features = catalog[feature_columns]
     max_clusters = min(10, len(catalog) - 1)
-    best: dict[str, object] = {
-        "n_clusters": 2,
-        "silhouette": -1.0,
-    }
-
+    inertia_by_cluster = {}
     for n_clusters in range(2, max_clusters + 1):
         clusterer = make_pipeline(
             SimpleImputer(strategy="median"),
             StandardScaler(),
             KMeans(n_clusters=n_clusters, random_state=42, n_init=50),
         )
-        labels = clusterer.fit_predict(features)
+        clusterer.fit(features)
+        inertia_by_cluster[n_clusters] = float(clusterer[-1].inertia_)
+
+    n_clusters = _find_elbow_cluster_count(inertia_by_cluster)
+    clusterer = make_pipeline(
+        SimpleImputer(strategy="median"),
+        StandardScaler(),
+        KMeans(n_clusters=n_clusters, random_state=42, n_init=50),
+    )
+    labels = clusterer.fit_predict(features)
+    unique_labels = len(set(labels))
+    silhouette = None
+    if 2 <= unique_labels < len(catalog):
         scaled_features = clusterer[:-1].transform(features)
-        score = float(silhouette_score(scaled_features, labels))
-        if score > float(best["silhouette"]):
-            best = {
-                "n_clusters": n_clusters,
-                "silhouette": score,
-            }
+        silhouette = float(silhouette_score(scaled_features, labels))
 
-    return best
+    return {
+        "n_clusters": n_clusters,
+        "silhouette": silhouette,
+    }
 
 
+# Similar-phone recommendations
 def recommend_similar_phones(
     catalog: pd.DataFrame,
     selected_product: str,
@@ -468,6 +543,7 @@ def recommend_similar_phones(
     ).head(limit)
 
 
+# Command-line dataset cleaning
 def main() -> None:
     parser = argparse.ArgumentParser(description="Clean mobile review data.")
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
