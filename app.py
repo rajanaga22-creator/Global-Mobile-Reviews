@@ -11,9 +11,11 @@ import streamlit as st
 from mob import (
     DEFAULT_OUTPUT,
     build_product_catalog,
+    calculate_product_silhouette,
     clean_mobile_data,
     cluster_products,
     recommend_similar_phones,
+    tune_product_clustering,
 )
 
 
@@ -53,8 +55,22 @@ if product_catalog.empty:
     st.error("No phone models have enough review data to make recommendations.")
     st.stop()
 
+product_tuning = tune_product_clustering(product_catalog)
+product_cluster_count = int(product_tuning["n_clusters"])
+product_feature_columns = list(product_tuning["feature_columns"])
 clustered_products = cluster_products(
-    product_catalog, n_clusters=min(4, len(product_catalog))
+    product_catalog,
+    n_clusters=product_cluster_count,
+    feature_columns=product_feature_columns,
+)
+product_silhouette = (
+    calculate_product_silhouette(
+        product_catalog,
+        n_clusters=product_cluster_count,
+        feature_columns=product_feature_columns,
+    )
+    if len(product_catalog) >= 3
+    else None
 )
 
 with st.sidebar:
@@ -147,6 +163,18 @@ st.write(
     "Phone models are grouped by review count, price, observed rating, and "
     "feature ratings. Cluster numbers are labels, not rankings."
 )
+if product_silhouette is None:
+    st.metric("Silhouette score", "Not available")
+else:
+    st.metric("Silhouette score", f"{product_silhouette:.3f}")
+    st.write(
+        f"Best configuration: **{product_cluster_count} clusters** using "
+        f"{len(product_feature_columns)} tuned features."
+    )
+    st.caption(
+        "Silhouette scores range from -1 to 1. Higher values indicate better "
+        "separated and more cohesive clusters."
+    )
 for segment, group in clustered_products.groupby("product_segment", sort=True):
     st.markdown(f"### Cluster {segment + 1}")
     metrics = st.columns(3)

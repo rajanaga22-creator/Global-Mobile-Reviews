@@ -8,6 +8,7 @@ from pathlib import Path
 import pandas as pd
 from sklearn.cluster import KMeans
 from sklearn.impute import SimpleImputer
+from sklearn.metrics import silhouette_score
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
@@ -211,10 +212,14 @@ def build_product_catalog(data: pd.DataFrame) -> pd.DataFrame:
 
 
 def cluster_products(
-    catalog: pd.DataFrame, n_clusters: int = 4
+    catalog: pd.DataFrame,
+    n_clusters: int = 4,
+    feature_columns: list[str] | None = None,
 ) -> pd.DataFrame:
     """Assign each phone model to a cluster based on its reviews and features."""
-    missing_columns = set(PRODUCT_CLUSTER_FEATURES).difference(catalog.columns)
+    if feature_columns is None:
+        feature_columns = PRODUCT_CLUSTER_FEATURES
+    missing_columns = set(feature_columns).difference(catalog.columns)
     if missing_columns:
         raise ValueError(
             "Product catalog is missing required columns: "
@@ -229,12 +234,204 @@ def cluster_products(
     clusterer = make_pipeline(
         SimpleImputer(strategy="median"),
         StandardScaler(),
-        KMeans(n_clusters=n_clusters, random_state=42, n_init=10),
+        KMeans(n_clusters=n_clusters, random_state=42, n_init=50),
     )
     clustered["product_segment"] = clusterer.fit_predict(
-        clustered[PRODUCT_CLUSTER_FEATURES]
+        clustered[feature_columns]
     )
     return clustered
+
+
+def calculate_product_silhouette(
+    catalog: pd.DataFrame,
+    n_clusters: int = 4,
+    feature_columns: list[str] | None = None,
+) -> float:
+    """Return the silhouette score for the product K-Means clustering."""
+    if feature_columns is None:
+        feature_columns = PRODUCT_CLUSTER_FEATURES
+    missing_columns = set(feature_columns).difference(catalog.columns)
+    if missing_columns:
+        raise ValueError(
+            "Product catalog is missing required columns: "
+            + ", ".join(sorted(missing_columns))
+        )
+    if not 2 <= n_clusters < len(catalog):
+        raise ValueError(
+            "n_clusters must be at least 2 and less than the number of phone models."
+        )
+
+    features = catalog[feature_columns]
+    clusterer = make_pipeline(
+        SimpleImputer(strategy="median"),
+        StandardScaler(),
+        KMeans(n_clusters=n_clusters, random_state=42, n_init=50),
+    )
+    labels = clusterer.fit_predict(features)
+    scaled_features = clusterer[:-1].transform(features)
+    return float(silhouette_score(scaled_features, labels))
+
+
+def tune_product_clustering(catalog: pd.DataFrame) -> dict[str, object]:
+    """Find the best valid product feature set and K-Means cluster count."""
+    if len(catalog) < 3:
+        return {
+            "n_clusters": 1,
+            "feature_columns": [],
+            "silhouette": None,
+        }
+
+    tuning_catalog = catalog.copy()
+    tuning_catalog["average_feature_rating"] = tuning_catalog[
+        [
+            "battery_rating",
+            "camera_rating",
+            "performance_rating",
+            "design_rating",
+            "display_rating",
+        ]
+    ].mean(axis=1)
+
+    feature_sets = [
+        PRODUCT_CLUSTER_FEATURES,
+        [
+            "avg_price_usd",
+            "avg_rating",
+            "battery_rating",
+            "camera_rating",
+            "performance_rating",
+            "design_rating",
+            "display_rating",
+        ],
+        ["avg_price_usd", "avg_rating", "average_feature_rating"],
+        ["avg_price_usd", "avg_rating"],
+        [
+            "battery_rating",
+            "camera_rating",
+            "performance_rating",
+            "design_rating",
+            "display_rating",
+        ],
+    ]
+
+    best: dict[str, object] = {
+        "n_clusters": 2,
+        "feature_columns": feature_sets[0],
+        "silhouette": -1.0,
+    }
+    max_clusters = min(10, len(tuning_catalog) - 1)
+
+    for feature_columns in feature_sets:
+        features = tuning_catalog[feature_columns]
+        for n_clusters in range(2, max_clusters + 1):
+            clusterer = make_pipeline(
+                SimpleImputer(strategy="median"),
+                StandardScaler(),
+                KMeans(
+                    n_clusters=n_clusters,
+                    random_state=42,
+                    n_init=50,
+                ),
+            )
+            labels = clusterer.fit_predict(features)
+            scaled_features = clusterer[:-1].transform(features)
+            score = float(silhouette_score(scaled_features, labels))
+            if score > float(best["silhouette"]):
+                best = {
+                    "n_clusters": n_clusters,
+                    "feature_columns": feature_columns,
+                    "silhouette": score,
+                }
+
+    return best
+
+
+def build_customer_catalog(data: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+    """Aggregate reviews into customer profiles suitable for clustering."""
+    required = {
+        "customer_name",
+        "age",
+        "rating",
+        "helpful_votes",
+        "battery_life_rating",
+        "camera_rating",
+        "performance_rating",
+        "design_rating",
+        "display_rating",
+        "verified_purchase",
+    }
+    missing_columns = required.difference(data.columns)
+    if missing_columns:
+        raise ValueError(
+            "Customer data is missing required columns: "
+            + ", ".join(sorted(missing_columns))
+        )
+
+    catalog = data.groupby("customer_name", as_index=False).agg(
+        average_age=("age", "mean"),
+        average_rating=("rating", "mean"),
+        average_helpful_votes=("helpful_votes", "mean"),
+        average_battery_rating=("battery_life_rating", "mean"),
+        average_camera_rating=("camera_rating", "mean"),
+        average_performance_rating=("performance_rating", "mean"),
+        average_design_rating=("design_rating", "mean"),
+        average_display_rating=("display_rating", "mean"),
+        verified_purchase_ratio=("verified_purchase", "mean"),
+    )
+    catalog["average_feature_rating"] = catalog[
+        [
+            "average_battery_rating",
+            "average_camera_rating",
+            "average_performance_rating",
+            "average_design_rating",
+            "average_display_rating",
+        ]
+    ].mean(axis=1)
+
+    feature_columns = [
+        "average_age",
+        "average_rating",
+        "average_helpful_votes",
+        "average_feature_rating",
+        "verified_purchase_ratio",
+    ]
+    return catalog, feature_columns
+
+
+def tune_customer_clustering(
+    catalog: pd.DataFrame,
+    feature_columns: list[str],
+) -> dict[str, object]:
+    """Find the best customer cluster count using an aggregated customer catalog."""
+    if len(catalog) < 3:
+        return {
+            "n_clusters": 1,
+            "silhouette": None,
+        }
+
+    features = catalog[feature_columns]
+    max_clusters = min(10, len(catalog) - 1)
+    best: dict[str, object] = {
+        "n_clusters": 2,
+        "silhouette": -1.0,
+    }
+
+    for n_clusters in range(2, max_clusters + 1):
+        clusterer = make_pipeline(
+            SimpleImputer(strategy="median"),
+            StandardScaler(),
+            KMeans(n_clusters=n_clusters, random_state=42, n_init=50),
+        )
+        labels = clusterer.fit_predict(features)
+        scaled_features = clusterer[:-1].transform(features)
+        score = float(silhouette_score(scaled_features, labels))
+        if score > float(best["silhouette"]):
+            best = {
+                "n_clusters": n_clusters,
+                "silhouette": score,
+            }
+
+    return best
 
 
 def recommend_similar_phones(
