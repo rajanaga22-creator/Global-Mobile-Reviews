@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
+import json
+import urllib.parse
+import urllib.request
 
 import pandas as pd
 import streamlit as st
@@ -21,6 +24,62 @@ from mob import (
 
 PROJECT_DIR = Path(__file__).resolve().parent
 SOURCE_CSV = PROJECT_DIR / "Mobile Reviews Sentiment null.csv"
+
+
+@st.cache_data(ttl=24 * 60 * 60)
+def get_phone_image_url(brand: str, model: str) -> str | None:
+    """Look up a thumbnail from Wikipedia for a brand and model."""
+    query = urllib.parse.quote(f"{brand} {model}")
+    url = (
+        "https://en.wikipedia.org/w/api.php?"
+        "action=query&generator=search&gsrlimit=1&prop=pageimages"
+        f"&gsrsearch={query}&piprop=thumbnail&pithumbsize=500&pilimit=1&format=json"
+    )
+    try:
+        request = urllib.request.Request(
+            url,
+            headers={"User-Agent": "Global-Mobile-Reviews/1.0"},
+        )
+        with urllib.request.urlopen(request, timeout=3) as response:
+            data = json.load(response)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    for page in data.get("query", {}).get("pages", {}).values():
+        thumbnail = page.get("thumbnail", {}).get("source")
+        if thumbnail:
+            return thumbnail
+    return None
+
+
+def render_phone_card(phone: pd.Series) -> None:
+    """Render a product card with an optional Wikimedia thumbnail."""
+    brand = str(phone["brand"])
+    model = str(phone["model"])
+    image_url = phone.get("image_url") if "image_url" in phone else None
+    if not isinstance(image_url, str) or not image_url.strip():
+        image_url = get_phone_image_url(brand, model)
+
+    if image_url:
+        st.image(image_url, use_column_width=True)
+    else:
+        st.markdown(
+            "<div style='height:220px;display:flex;align-items:center;"
+            "justify-content:center;border:1px solid #ddd;border-radius:8px;"
+            "font-size:64px'>📱</div>",
+            unsafe_allow_html=True,
+        )
+
+    st.markdown(f"**{brand} {model}**")
+    st.write(f"${phone['avg_price_usd']:,.0f}")
+    rating = (
+        f"{phone['avg_rating']:.2f} / 5"
+        if pd.notna(phone["avg_rating"])
+        else "Rating unavailable"
+    )
+    st.caption(f"{rating} · {int(phone['review_count']):,} reviews")
+    if "similarity" in phone:
+        st.caption(f"Similarity: {phone['similarity']:.0%}")
 
 
 @st.cache_data
@@ -127,6 +186,14 @@ st.subheader("Recommended phones")
 if recommendations.empty:
     st.info("No phones match these filters. Try increasing your budget or lowering the minimum rating.")
 else:
+    for start in range(0, len(recommendations), 5):
+        cards = recommendations.iloc[start:start + 5]
+        card_columns = st.columns(len(cards))
+        for column, (_, phone) in zip(card_columns, cards.iterrows()):
+            with column:
+                with st.container(border=True):
+                    render_phone_card(phone)
+
     shown_recommendations = recommendations.rename(
         columns={
             "product_label": "Phone",
@@ -147,7 +214,7 @@ else:
             ]
         ].round(2),
         hide_index=True,
-        width="stretch",
+        use_container_width=True,
     )
 
 st.caption(
@@ -201,7 +268,7 @@ for segment, group in clustered_products.groupby("product_segment", sort=True):
         .sort_values(["Brand", "Model"])
         .round(2),
         hide_index=True,
-        width="stretch",
+        use_container_width=True,
     )
 
 with st.expander("About the data"):
